@@ -1,6 +1,6 @@
-# app.py
-import streamlit as st
-import joblib, re, os
+# app.py (Gradio version)
+import gradio as gr
+import joblib, re, os, tempfile
 from PyPDF2 import PdfReader
 import docx2txt
 from sklearn.metrics.pairwise import cosine_similarity
@@ -11,15 +11,14 @@ from nltk.corpus import stopwords
 from pathlib import Path
 from textwrap import shorten
 
-# ========== NLTK stopwords (download only if missing) ==========
+# ---------- NLTK stopwords (download if necessary) ----------
 try:
     stop_words = set(stopwords.words("english"))
 except LookupError:
-    with st.spinner("Downloading NLTK data..."):
-        nltk.download('stopwords')
+    nltk.download("stopwords")
     stop_words = set(stopwords.words("english"))
 
-# ========== Helpers & Patterns ==========
+# ---------- Helpers & Patterns ----------
 EMAIL_RE = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
 PHONE_RE = re.compile(r'(\+?\d[\d\-\s]{8,}\d)')
 SECTION_HINTS = [
@@ -37,27 +36,67 @@ def clean_text(t):
     tokens = [w for w in t.split() if w not in stop_words]
     return " ".join(tokens)
 
-def extract_text_from_file(uploaded_file) -> str:
-    name = uploaded_file.name if hasattr(uploaded_file, "name") else str(uploaded_file)
+def extract_text_from_file(uploaded):
+    """
+    uploaded may be:
+      - a local path (str) when Gradio provides it,
+      - a (name, bytes) tuple in some contexts,
+      - a file-like object with .name attribute.
+    """
+    path = None
+    if uploaded is None:
+        return ""
+    # If Gradio gives a string path
+    if isinstance(uploaded, str) and os.path.exists(uploaded):
+        path = uploaded
+    # If it's a tuple (name, fileobj) sometimes returned
+    elif isinstance(uploaded, tuple) and len(uploaded) >= 1:
+        cand = uploaded[0]
+        if isinstance(cand, str) and os.path.exists(cand):
+            path = cand
+    # If it has .name attribute (file-like)
+    elif hasattr(uploaded, "name") and os.path.exists(uploaded.name):
+        path = uploaded.name
+
+    # If we still don't have a path, try saving the bytes to temp
+    if path is None:
+        try:
+            # uploaded might be a file-like object; read bytes
+            data = uploaded.read()
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
+            tmp.write(data)
+            tmp.close()
+            path = tmp.name
+        except Exception:
+            return ""
+
+    # Now extract using file path & extension
+    name = str(path).lower()
     try:
-        if name.lower().endswith(".pdf"):
-            reader = PdfReader(uploaded_file)
+        if name.endswith(".pdf"):
+            reader = PdfReader(path)
             txt = ""
             for p in reader.pages:
                 txt += p.extract_text() or ""
             return txt
-        elif name.lower().endswith(".docx"):
-            return docx2txt.process(uploaded_file)
+        elif name.endswith(".docx"):
+            return docx2txt.process(path)
         else:
-            return uploaded_file.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        st.error("Error extracting text from the file.")
+            # fallback: read as text
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+    except Exception:
         return ""
 
 def jd_resume_match_score(resume_text: str, jd_text: str, vectorizer) -> float:
-    A = vectorizer.transform([resume_text])
-    B = vectorizer.transform([jd_text])
-    return float(cosine_similarity(A, B)[0][0])
+    if vectorizer is None:
+        return None
+    try:
+        A = vectorizer.transform([resume_text])
+        B = vectorizer.transform([jd_text])
+        return float(cosine_similarity(A, B)[0][0])
+    except Exception:
+        return None
 
 def estimate_pages(resume_text: str) -> int:
     words = len(resume_text.split())
@@ -84,7 +123,6 @@ def ats_score(resume_text: str, jd_text: str = "", base_vectorizer=None) -> dict
     part = min(20, found * 2)
     score += part; breakdown["sections_(20)"] = part
     # Keyword coverage (40)
-    keywords = []
     if jd_text and jd_text.strip():
         vect = TfidfVectorizer(max_features=50, stop_words='english')
         mat = vect.fit_transform([jd_text])
@@ -109,7 +147,7 @@ def ats_score(resume_text: str, jd_text: str = "", base_vectorizer=None) -> dict
     breakdown["phone_found"] = phone_ok
     return breakdown
 
-# ========== Load models safely ==========
+# ========== Load models (if present) ==========
 MODEL_DIR = Path("models")
 clf = tfidf_vec = label_encoder = None
 if MODEL_DIR.exists():
@@ -118,81 +156,83 @@ if MODEL_DIR.exists():
         tfidf_vec = joblib.load(MODEL_DIR/"tfidf_vectorizer.joblib")
         label_encoder = joblib.load(MODEL_DIR/"label_encoder.joblib")
     except Exception as e:
-        st.error("Error loading model artifacts. Make sure /models contains joblib files.")
+        clf = tfidf_vec = label_encoder = None
 else:
-    st.warning("No models/ folder found — classifier won't be available (upload the models folder).")
+    clf = tfidf_vec = label_encoder = None
 
-# ========== UI tweaks & CSS ==========
-st.set_page_config(page_title="AI Resume Analyzer", page_icon="🧠", layout="wide")
-st.markdown("""
-<style>
-body {background: linear-gradient(180deg,#0f172a,#0b1220);}
-h1 {color: #9be7ff; text-align:center;}
-.stApp { color: #e6eef6; }
-div.block-container{padding:1rem 2rem;}
-.stButton>button {background:linear-gradient(90deg,#7c3aed,#06b6d4); border:none; color:white;}
-.stMetric {border-radius: 12px; padding: 8px;}
-</style>
-""", unsafe_allow_html=True)
+# ========== Analysis function ==========
+def analyze_resume(uploaded_file, jd_text):
+    resume_text_raw = extract_text_from_file(uploaded_file)
+    if not resume_text_raw or not resume_text_raw.strip():
+        return (
+            "Could not extract text from the file.",
+            "Model not available",
+            None,
+            None,
+            {},
+            "",
+            None
+        )
 
-# ========== Page layout ==========
-st.title("🧠 AI Resume Analyzer — Clean, Fast, Smart")
-st.write("Upload a resume (PDF/DOCX). Optionally paste a Job Description to get match & ATS feedback.")
-left, right = st.columns((2,1))
+    resume_clean = clean_text(resume_text_raw)
 
-with right:
-    st.image("https://raw.githubusercontent.com/huggingface/transformers/main/docs/source/_static/img/transformers-logo.png", width=120)  # optional - replace with your logo
-    st.write("**Quick actions**")
-    if st.button("Example Resume"):
-        st.info("You can upload a resume file to test the app.")
-
-with left:
-    jd_text = st.text_area("Paste Job Description (optional)", height=140)
-    uploaded = st.file_uploader("Upload Resume (.pdf or .docx)", type=["pdf","docx"])
-    show_full = st.checkbox("Show full extracted text", value=False)
-
-if uploaded:
-    with st.spinner("Extracting and analyzing..."):
-        resume_text_raw = extract_text_from_file(uploaded)
-        if not resume_text_raw.strip():
-            st.error("Could not extract text from the uploaded file.")
-        else:
-            resume_clean = clean_text(resume_text_raw)
-            # Predicted category
-            if clf is not None and tfidf_vec is not None and label_encoder is not None:
-                try:
-                    pred_idx = clf.predict(tfidf_vec.transform([resume_clean]))[0]
-                    category = label_encoder.inverse_transform([pred_idx])[0]
-                except Exception:
-                    category = "Prediction failed"
-            else:
-                category = "Model not available"
-            # Match score
-            match = None
-            if jd_text and tfidf_vec is not None:
-                match = jd_resume_match_score(resume_clean, clean_text(jd_text), tfidf_vec)
-            # ATS
-            ats = ats_score(resume_text_raw, jd_text, base_vectorizer=tfidf_vec)
-    # Display results
-    col1, col2, col3 = st.columns(3)
-    col1.metric("ATS Score", f"{ats['total']} / 100")
-    col2.metric("Estimated Pages", ats['pages_estimated'])
-    if match is not None:
-        col3.metric("JD Match (0-1)", f"{match:.3f}")
-    st.markdown("---")
-    st.subheader("Predicted Domain / Category")
-    st.success(category)
-    st.subheader("ATS Breakdown")
-    st.json({k:v for k,v in ats.items() if k.endswith(')')})
-    st.subheader("Suggested keywords to add")
-    st.write(", ".join(ats["missing_keywords_suggestion"]))
-    st.markdown("---")
-    st.subheader("Resume Preview")
-    if show_full:
-        st.text(resume_text_raw)
+    # category
+    if clf is not None and tfidf_vec is not None and label_encoder is not None:
+        try:
+            pred_idx = clf.predict(tfidf_vec.transform([resume_clean]))[0]
+            category = label_encoder.inverse_transform([pred_idx])[0]
+        except Exception:
+            category = "Prediction failed"
     else:
-        st.text(shorten(resume_text_raw, width=1200, placeholder="..."))
-    # Allow download of cleaned resume text
-    st.download_button("Download cleaned resume text", data=resume_clean, file_name="resume_clean.txt")
-else:
-    st.info("Upload a resume to begin analysis.")
+        category = "Model not available"
+
+    # match
+    match_score = None
+    if jd_text and tfidf_vec is not None:
+        match_score = jd_resume_match_score(resume_clean, clean_text(jd_text), tfidf_vec)
+
+    # ats
+    ats = ats_score(resume_text_raw, jd_text, base_vectorizer=tfidf_vec)
+
+    # create a temp file for the cleaned resume text to allow download in Gradio
+    tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+    tmpf.write(resume_clean.encode("utf-8"))
+    tmpf.flush()
+    tmpf.close()
+    download_path = tmpf.name
+
+    preview = resume_text_raw[:4000] + ("..." if len(resume_text_raw) > 4000 else "")
+
+    suggestions = ", ".join(ats.get("missing_keywords_suggestion", []))
+    return (preview, category, match_score, ats.get("total", None), ats, suggestions, download_path)
+
+# ========== Gradio UI ==========
+css = """
+body {background: linear-gradient(180deg,#0f172a,#071025);}
+.gr-button { background: linear-gradient(90deg,#7c3aed,#06b6d4); color: white;}
+"""
+
+with gr.Blocks(title="AI Resume Analyzer", css=css) as demo:
+    gr.Markdown("# 🧠 AI Resume Analyzer")
+    with gr.Row():
+        with gr.Column(scale=2):
+            file_input = gr.File(label="Upload Resume (.pdf or .docx)")
+            jd_input = gr.Textbox(label="Paste Job Description (optional)", lines=4)
+            analyze_btn = gr.Button("Analyze", variant="primary")
+        with gr.Column(scale=1):
+            preview_out = gr.Textbox(label="Resume Preview (first 4000 chars)", lines=12)
+            category_out = gr.Textbox(label="Predicted Category")
+            match_out = gr.Number(label="JD–Resume Match (0–1)")
+            ats_out = gr.Number(label="ATS Score (0–100)")
+            ats_json = gr.JSON(label="ATS Breakdown")
+            suggestions_out = gr.Textbox(label="Suggested keywords to add")
+            download_file = gr.File(label="Download cleaned resume text")
+
+    analyze_btn.click(
+        fn=analyze_resume,
+        inputs=[file_input, jd_input],
+        outputs=[preview_out, category_out, match_out, ats_out, ats_json, suggestions_out, download_file],
+    )
+
+if __name__ == "__main__":
+    demo.launch()
