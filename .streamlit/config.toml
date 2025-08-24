@@ -1,2 +1,9 @@
 [global]
 pythonVersion = "3.11"
+
+[theme]
+primaryColor = "#7c3aed"
+backgroundColor = "#0b1220"
+secondaryBackgroundColor = "#0f172a"
+textColor = "#e6eef6"
+font = "sans serif"
