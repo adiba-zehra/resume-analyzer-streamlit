@@ -3,7 +3,7 @@ pandas==2.2.0
 numpy==1.26.4
 scikit-learn==1.4.2
 joblib==1.4.2
-nltk==3.9.1
+nltk==3.8.1
 PyPDF2==3.0.1
 docx2txt==0.8
 protobuf==5.27.2
